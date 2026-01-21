@@ -1,0 +1,14 @@
+streamlit
+sentence-transformers
+chromadb
+PyPDF2
+pillow
+pdf2image
+pytesseract
+pymupdf
+imagehash
+requests
+python-docx
+python-pptx
+markdown
+beautifulsoup4
