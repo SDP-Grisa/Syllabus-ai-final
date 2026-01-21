@@ -1,5 +1,5 @@
 import streamlit as st
-import os, io, math, re, shutil
+import os, io, math, re, shutil, zipfile, tempfile
 from io import BytesIO
 from typing import List, Dict, Tuple
 from collections import defaultdict
@@ -36,7 +36,6 @@ st.title("📚 Advanced RAG Syllabus Assistant")
 st.caption("Multi-stage retrieval with semantic chunking and cross-encoder reranking")
 
 # ================= SECRETS =================
-# HF_TOKEN = st.secrets["HF_TOKEN"]
 HF_TOKEN = st.secrets["HF_TOKEN"]
 HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
 MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct:fastest"
@@ -86,6 +85,8 @@ HEADER_FOOTER_PATTERNS = [
     r'^\d+\s*/\s*\d+$',
 ]
 
+SUPPORTED_EXTENSIONS = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.md']
+
 # ================= HEADER/FOOTER REMOVAL =================
 def is_header_footer(text: str) -> bool:
     text = text.strip()
@@ -103,6 +104,42 @@ def clean_text(text: str) -> str:
     result = '\n'.join(cleaned)
     result = re.sub(r'\n{3,}', '\n\n', result)
     return result.strip()
+
+# ================= ZIP FILE HANDLING =================
+def extract_files_from_zip(zip_bytes: bytes) -> List[Dict]:
+    """
+    Extract all supported files from a ZIP archive.
+    Returns list of dicts with 'name' and 'bytes' keys.
+    """
+    extracted_files = []
+    
+    try:
+        with zipfile.ZipFile(BytesIO(zip_bytes), 'r') as zip_ref:
+            for file_info in zip_ref.filelist:
+                # Skip directories
+                if file_info.is_dir():
+                    continue
+                
+                filename = file_info.filename
+                # Get file extension
+                ext = os.path.splitext(filename)[1].lower()
+                
+                # Check if supported
+                if ext in SUPPORTED_EXTENSIONS:
+                    try:
+                        file_bytes = zip_ref.read(file_info)
+                        # Use just the filename, not the full path
+                        clean_name = os.path.basename(filename)
+                        extracted_files.append({
+                            'name': clean_name,
+                            'bytes': file_bytes
+                        })
+                    except Exception as e:
+                        st.warning(f"⚠️ Could not extract {filename}: {str(e)}")
+    except Exception as e:
+        st.error(f"❌ Error reading ZIP file: {str(e)}")
+    
+    return extracted_files
 
 # ================= TEXT EXTRACTION BY FILE TYPE =================
 def extract_text_from_txt(file_bytes: bytes) -> List[Dict]:
@@ -253,7 +290,6 @@ def semantic_chunking(text: str, chunk_size: int = SEMANTIC_CHUNK_SIZE) -> List[
     Semantic chunking: splits text at sentence boundaries while respecting chunk size.
     Preserves semantic coherence by not breaking mid-sentence.
     """
-    # Split into sentences
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
     current_chunk = []
@@ -264,7 +300,6 @@ def semantic_chunking(text: str, chunk_size: int = SEMANTIC_CHUNK_SIZE) -> List[
         sentence_size = len(words)
         
         if current_size + sentence_size > chunk_size and current_chunk:
-            # Save current chunk and start new one
             chunks.append(' '.join(current_chunk))
             current_chunk = [sentence]
             current_size = sentence_size
@@ -291,7 +326,6 @@ def sliding_window_chunking(text: str, window_size: int = SLIDING_WINDOW_SIZE,
         if chunk.strip():
             chunks.append(chunk)
         
-        # Stop if we're at the end
         if i + window_size >= len(words):
             break
     
@@ -300,8 +334,6 @@ def sliding_window_chunking(text: str, window_size: int = SLIDING_WINDOW_SIZE,
 def hybrid_chunking(pages: List[Dict]) -> List[Dict]:
     """
     Hybrid approach: combines semantic and sliding window chunking.
-    - Semantic chunks for coherent content
-    - Sliding windows to ensure no information is lost at boundaries
     """
     all_chunks = []
     chunk_id = 0
@@ -309,11 +341,9 @@ def hybrid_chunking(pages: List[Dict]) -> List[Dict]:
     for p in pages:
         text = p["text"]
         
-        # First apply semantic chunking
         semantic_chunks = semantic_chunking(text, SEMANTIC_CHUNK_SIZE)
         
         for sem_chunk in semantic_chunks:
-            # Add semantic chunk
             all_chunks.append({
                 "page": p["page"],
                 "text": sem_chunk,
@@ -323,7 +353,6 @@ def hybrid_chunking(pages: List[Dict]) -> List[Dict]:
             })
             chunk_id += 1
         
-        # Also apply sliding window for overlap coverage
         if len(text.split()) > SLIDING_WINDOW_SIZE:
             window_chunks = sliding_window_chunking(text, SLIDING_WINDOW_SIZE, WINDOW_OVERLAP)
             
@@ -342,17 +371,11 @@ def hybrid_chunking(pages: List[Dict]) -> List[Dict]:
 # ================= MULTI-STAGE RETRIEVAL WITH RERANKING =================
 def retrieve_and_rerank(question: str, collection, top_k: int = FINAL_CONTEXT_K) -> List[Dict]:
     """
-    Multi-stage retrieval:
-    1. Initial retrieval: Get top N candidates using semantic similarity
-    2. Reranking: Use cross-encoder to rerank candidates based on relevance
-    3. Deduplication: Remove similar/duplicate chunks
-    4. Return top K most relevant chunks
+    Multi-stage retrieval with reranking and deduplication.
     """
-    # Stage 1: Initial retrieval with higher K
     q_emb = embedding_model.encode([question]).tolist()
     res = collection.query(q_emb, n_results=INITIAL_RETRIEVAL_K)
     
-    # Prepare candidates
     candidates = []
     for doc, metadata, distance in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
         candidates.append({
@@ -360,34 +383,29 @@ def retrieve_and_rerank(question: str, collection, top_k: int = FINAL_CONTEXT_K)
             "page": metadata.get("page", 1),
             "doc": metadata.get("doc", "unknown"),
             "chunk_type": metadata.get("chunk_type", "unknown"),
-            "initial_score": 1 - distance  # Convert distance to similarity
+            "initial_score": 1 - distance
         })
     
     if not candidates:
         return []
     
-    # Stage 2: Rerank using cross-encoder
     pairs = [[question, c["text"]] for c in candidates]
     rerank_scores = cross_encoder.predict(pairs)
     
     for i, score in enumerate(rerank_scores):
         candidates[i]["rerank_score"] = float(score)
     
-    # Sort by rerank score
     candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
     
-    # Stage 3: Deduplication - remove very similar chunks
     final_chunks = []
     seen_texts = []
     
     for candidate in candidates[:RERANK_TOP_K]:
-        # Check if this chunk is too similar to already selected ones
         is_duplicate = False
         for seen in seen_texts:
-            # Simple similarity check based on text overlap
             overlap = len(set(candidate["text"].split()) & set(seen.split()))
             total = len(set(candidate["text"].split()) | set(seen.split()))
-            if total > 0 and overlap / total > 0.7:  # 70% overlap threshold
+            if total > 0 and overlap / total > 0.7:
                 is_duplicate = True
                 break
         
@@ -402,6 +420,7 @@ def retrieve_and_rerank(question: str, collection, top_k: int = FINAL_CONTEXT_K)
 
 # ================= MULTI-QUESTION PARSING =================
 def parse_multiple_questions(user_input: str) -> List[str]:
+    """Parse multiple questions from user input"""
     questions = re.split(r'\n+|\?+(?=\s*[A-Z0-9])', user_input)
     parsed = []
     
@@ -417,16 +436,12 @@ def parse_multiple_questions(user_input: str) -> List[str]:
     
     return parsed
 
-# ================= ENHANCED LLM QUERY WITH BETTER PROMPTING =================
+# ================= ENHANCED LLM QUERY =================
 def llm_query(question: str, chunks: List[Dict]) -> str:
-    """
-    Enhanced LLM query with structured prompting for better answers.
-    Instructs the model to provide well-formatted, comprehensive responses.
-    """
+    """Enhanced LLM query with structured prompting."""
     if not chunks:
         return "❌ Answer not found in the documents."
     
-    # Build rich context with source attribution
     context_parts = []
     for i, c in enumerate(chunks, 1):
         score_info = f"[Relevance: {c.get('rerank_score', 0):.2f}]"
@@ -435,15 +450,15 @@ def llm_query(question: str, chunks: List[Dict]) -> str:
     
     context = "\n".join(context_parts)
     
-    # Enhanced prompt with explicit formatting instructions
     prompt = f"""You are a knowledgeable teaching assistant. Answer the question using ONLY the document content provided below.
 
 **INSTRUCTIONS:**
-1. Provide a consice and well-structured answer
+1. Provide a comprehensive, well-structured answer
 2. Use bullet points for listing multiple items or key points
 3. Use paragraphs for explanations and descriptions
 4. Include specific details, dates, numbers, and examples from the documents
-6. Add very short explanations to help understanding, don't add irrelavent information
+5. If the answer involves multiple aspects, organize them clearly
+6. Add context and brief explanations to help understanding
 7. Cite the source number (e.g., "Source 1") when referencing specific information
 8. If the answer is not in the documents, clearly state: "Answer not found in the documents."
 
@@ -486,17 +501,19 @@ def process_multiple_questions(questions: List[str], collection) -> Dict[str, Di
     results = {}
     
     for q in questions:
-        # Use multi-stage retrieval with reranking
         chunks = retrieve_and_rerank(q, collection, FINAL_CONTEXT_K)
-        
-        # Get answer
         answer = llm_query(q, chunks)
         
-        # Store answer with metadata
         results[q] = {
             "answer": answer,
             "chunks_used": len(chunks),
-            "sources": [{"doc": c.get("doc"), "page": c.get("page"), "score": c.get("rerank_score", 0)} for c in chunks]
+            "sources": [
+                {
+                    "doc": c.get("doc"), 
+                    "page": c.get("page"), 
+                    "score": c.get("rerank_score", 0)
+                } for c in chunks
+            ]
         }
     
     return results
@@ -508,6 +525,10 @@ if "processed_files" not in st.session_state:
     st.session_state.processed_files = []
 if "chunk_stats" not in st.session_state:
     st.session_state.chunk_stats = {}
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "query_mode" not in st.session_state:
+    st.session_state.query_mode = "chat"  # 'chat' or 'batch'
 
 # ================= UI =================
 st.header("📤 Upload Documents")
@@ -528,8 +549,8 @@ with st.sidebar:
     window_overlap = st.slider("Window Overlap (words)", 50, 300, WINDOW_OVERLAP, 25)
 
 uploaded_files = st.file_uploader(
-    "Upload multiple documents (PDF, DOCX, PPTX, TXT, MD)",
-    type=["pdf", "docx", "doc", "pptx", "ppt", "txt", "md"],
+    "Upload documents or ZIP files containing documents",
+    type=["pdf", "docx", "doc", "pptx", "ppt", "txt", "md", "zip"],
     accept_multiple_files=True
 )
 
@@ -537,26 +558,47 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
     with st.spinner("Processing documents with hybrid chunking strategy..."):
         all_pages = []
         all_images = []
+        files_to_process = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        for idx, uploaded in enumerate(uploaded_files):
-            status_text.info(f"📄 Processing: {uploaded.name}")
+        # First, handle ZIP files and collect all files to process
+        status_text.info("📦 Extracting files from ZIP archives...")
+        for uploaded in uploaded_files:
+            if uploaded.name.lower().endswith('.zip'):
+                zip_bytes = uploaded.read()
+                extracted = extract_files_from_zip(zip_bytes)
+                files_to_process.extend(extracted)
+                st.success(f"✅ Extracted {len(extracted)} files from {uploaded.name}")
+            else:
+                files_to_process.append({
+                    'name': uploaded.name,
+                    'bytes': uploaded.read()
+                })
+        
+        if not files_to_process:
+            st.error("❌ No valid files found to process")
+            st.stop()
+        
+        st.info(f"📄 Processing {len(files_to_process)} total files...")
+        
+        # Process all files
+        for idx, file_data in enumerate(files_to_process):
+            status_text.info(f"📄 Processing: {file_data['name']}")
             
-            file_bytes = uploaded.read()
-            pages = extract_text_from_file(file_bytes, uploaded.name)
+            pages = extract_text_from_file(file_data['bytes'], file_data['name'])
             
             for p in pages:
-                p["doc"] = uploaded.name
+                p["doc"] = file_data['name']
             
             all_pages.extend(pages)
             
-            if uploaded.name.lower().endswith('.pdf'):
-                images = extract_images_from_pdf(file_bytes, uploaded.name)
+            if file_data['name'].lower().endswith('.pdf'):
+                images = extract_images_from_pdf(file_data['bytes'], file_data['name'])
                 all_images.extend(images)
             
-            progress_bar.progress((idx + 1) / len(uploaded_files))
+            progress_bar.progress((idx + 1) / len(files_to_process))
         
         status_text.info("🔍 Performing OCR on extracted images...")
         for img in all_images:
@@ -597,7 +639,6 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
                 ids=[f"c{i}" for i in range(len(texts))]
             )
             
-            # Store statistics
             semantic_count = sum(1 for c in chunks if c.get("chunk_type") == "semantic")
             window_count = sum(1 for c in chunks if c.get("chunk_type") == "window")
             
@@ -607,7 +648,8 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
                 "window": window_count
             }
             st.session_state.ready = True
-            st.session_state.processed_files = [f.name for f in uploaded_files]
+            st.session_state.processed_files = [f['name'] for f in files_to_process]
+            st.session_state.chat_history = []  # Reset chat history
             
             status_text.empty()
             progress_bar.empty()
@@ -616,7 +658,7 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
             
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("Documents", len(uploaded_files))
+                st.metric("Files Processed", len(files_to_process))
             with col2:
                 st.metric("Total Chunks", len(chunks))
             with col3:
@@ -624,7 +666,9 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
             with col4:
                 st.metric("Window Chunks", window_count)
             
-            st.info(f"📄 **Processed Files:** {', '.join(st.session_state.processed_files)}")
+            with st.expander("📄 Processed Files", expanded=False):
+                for fname in st.session_state.processed_files:
+                    st.text(f"✓ {fname}")
         else:
             st.error("❌ No content extracted from documents")
 
@@ -632,8 +676,6 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
 if st.session_state.ready:
     st.divider()
     st.header("💬 Ask Questions")
-    
-    st.info("💡 **Tips:** You can ask multiple questions (separate with new lines). The system uses multi-stage retrieval with reranking for best results.")
     
     # Show chunk statistics
     with st.expander("📊 Document Statistics", expanded=False):
@@ -646,55 +688,114 @@ if st.session_state.ready:
         with col3:
             st.metric("Sliding Window Chunks", stats.get("window", 0))
     
-    user_input = st.text_area(
-        "Enter your question(s)",
-        height=150,
-        placeholder="Example:\nWhat are the course objectives?\nWhen is the final exam?\nWhat textbook is required?"
-    )
+    st.info("💡 **Tip:** You can ask single or multiple questions. Separate multiple questions with new lines for batch processing.")
     
-    if st.button("🔍 Get Answers", type="primary") and user_input:
-        questions = parse_multiple_questions(user_input)
-        
-        st.subheader(f"📝 Processing {len(questions)} question(s)")
-        
-        col = chroma_client.get_collection("syllabus")
-        
-        with st.spinner("🔄 Retrieving and reranking relevant content..."):
-            results = process_multiple_questions(questions, col)
-        
-        # Display results with enhanced formatting
-        for i, (question, result) in enumerate(results.items(), 1):
-            with st.container():
-                st.markdown(f"### ❓ Question {i}")
-                st.markdown(f"**{question}**")
-                
-                # Answer section
-                st.markdown("#### 📖 Answer")
-                answer = result["answer"]
-                
-                # Format the answer in a nice box
+    # Display chat history
+    for i, chat in enumerate(st.session_state.chat_history):
+        with st.container():
+            # User message(s)
+            if isinstance(chat['question'], list):
+                # Multiple questions (batch)
+                st.markdown("**👤 You asked:**")
+                for idx, q in enumerate(chat['question'], 1):
+                    st.markdown(f"{idx}. {q}")
+            else:
+                # Single question
+                st.markdown(f"**👤 You:** {chat['question']}")
+            
+            st.markdown("")  # Spacing
+            
+            # Assistant response(s)
+            if isinstance(chat['answer'], dict):
+                # Multiple answers (batch)
+                for idx, (question, answer_data) in enumerate(chat['answer'].items(), 1):
+                    st.markdown(f"**🤖 Assistant (Question {idx}):**")
+                    st.markdown(f"""
+                    <div style="background-color: #000000; padding: 20px; border-radius: 10px; border-left: 5px solid #4CAF50; margin-bottom: 15px;">
+                    <strong style="color: #1f77b4;">Q{idx}: {question}</strong><br><br>
+                    {answer_data['answer']}
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Sources for this specific question
+                    with st.expander(f"📚 Sources for Question {idx}", expanded=False):
+                        st.caption(f"**Chunks analyzed:** {answer_data.get('chunks_used', 0)}")
+                        for j, source in enumerate(answer_data.get('sources', []), 1):
+                            score_color = "#4CAF50" if source['score'] > 0.5 else "#FF9800"
+                            st.markdown(f"""
+                            **Source {j}:** {source['doc']} (Page {source['page']})  
+                            <span style="color: {score_color}">Relevance Score: {source['score']:.3f}</span>
+                            """, unsafe_allow_html=True)
+            else:
+                # Single answer
+                st.markdown("**🤖 Assistant:**")
                 st.markdown(f"""
-                <div style="background-color: #000000; padding: 20px; border-radius: 10px; border-left: 5px solid #4CAF50;">
-                {answer}
+                <div style="background-color: #000000; padding: 20px; border-radius: 10px; border-left: 5px solid #4CAF50; margin-bottom: 10px;">
+                {chat['answer']}
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # Source information in expander
-                with st.expander("📚 Sources Used", expanded=False):
-                    st.caption(f"**Chunks analyzed:** {result['chunks_used']}")
-                    
-                    for j, source in enumerate(result['sources'], 1):
+                # Sources
+                with st.expander(f"📚 Sources", expanded=False):
+                    st.caption(f"**Chunks analyzed:** {chat.get('chunks_used', 0)}")
+                    for j, source in enumerate(chat.get('sources', []), 1):
                         score_color = "#4CAF50" if source['score'] > 0.5 else "#FF9800"
                         st.markdown(f"""
                         **Source {j}:** {source['doc']} (Page {source['page']})  
                         <span style="color: {score_color}">Relevance Score: {source['score']:.3f}</span>
                         """, unsafe_allow_html=True)
+            
+            st.divider()
+    
+    # Chat input at the bottom - handles both single and multiple questions
+    user_input = st.chat_input("Ask one or multiple questions (separate with new lines)...")
+    
+    if user_input:
+        col = chroma_client.get_collection("syllabus")
+        
+        # Parse input to check for multiple questions
+        questions = parse_multiple_questions(user_input)
+        
+        if len(questions) > 1:
+            # Batch processing - multiple questions
+            with st.spinner(f"🔄 Processing {len(questions)} questions..."):
+                results = process_multiple_questions(questions, col)
                 
-                st.divider()
+                # Store in chat history as batch
+                chat_entry = {
+                    "question": questions,  # List of questions
+                    "answer": results,      # Dict of answers
+                    "is_batch": True
+                }
+                st.session_state.chat_history.append(chat_entry)
+        else:
+            # Single question processing
+            with st.spinner("🔄 Retrieving and analyzing..."):
+                chunks = retrieve_and_rerank(questions[0], col, final_k)
+                answer = llm_query(questions[0], chunks)
+                
+                # Store in chat history as single
+                chat_entry = {
+                    "question": questions[0],
+                    "answer": answer,
+                    "chunks_used": len(chunks),
+                    "sources": [
+                        {
+                            "doc": c.get("doc"), 
+                            "page": c.get("page"), 
+                            "score": c.get("rerank_score", 0)
+                        } for c in chunks
+                    ],
+                    "is_batch": False
+                }
+                st.session_state.chat_history.append(chat_entry)
+        
+        # Rerun to display the new message
+        st.rerun()
 
-# ================= RESET =================
+# ================= CONTROLS =================
 st.divider()
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     if st.button("🔄 Reset Database"):
@@ -707,16 +808,23 @@ with col1:
         st.session_state.ready = False
         st.session_state.processed_files = []
         st.session_state.chunk_stats = {}
+        st.session_state.chat_history = []
         st.success("✅ Reset complete")
         st.rerun()
 
 with col2:
-    if st.session_state.ready:
-        st.metric("📚 Documents Loaded", len(st.session_state.processed_files))
+    if st.session_state.ready and st.button("🗑️ Clear Chat History"):
+        st.session_state.chat_history = []
+        st.success("✅ Chat cleared")
+        st.rerun()
 
 with col3:
     if st.session_state.ready:
-        st.metric("🧩 Total Chunks", st.session_state.chunk_stats.get("total", 0))
+        st.metric("📚 Documents", len(st.session_state.processed_files))
+
+with col4:
+    if st.session_state.ready:
+        st.metric("💬 Messages", len(st.session_state.chat_history))
 
 # ================= FOOTER =================
 st.divider()
@@ -727,4 +835,7 @@ st.caption("""
 - 🔍 Deduplication to avoid redundant content
 - 📊 Relevance scoring for transparency
 - 🎨 Enhanced answer formatting
+- 💬 Chat mode with single or batch question support
+- 📋 Intelligent parsing: automatically detects multiple questions
+- 📦 ZIP file support for bulk uploads
 """)
