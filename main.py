@@ -4,7 +4,7 @@ from io import BytesIO
 from typing import List, Dict
 import numpy as np
 
-# Fix for ChromaDB on Streamlit Cloud
+# # Fix for ChromaDB on Streamlit Cloud
 # import sys
 # __import__('pysqlite3')
 # sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
