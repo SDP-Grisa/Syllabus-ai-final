@@ -1,9 +1,13 @@
 import streamlit as st
-import os, io, math, re, shutil, zipfile, tempfile
+import os, io, re, shutil, zipfile
 from io import BytesIO
-from typing import List, Dict, Tuple
-from collections import defaultdict
+from typing import List, Dict
 import numpy as np
+
+# Fix for ChromaDB on Streamlit Cloud
+# import sys
+# __import__('pysqlite3')
+# sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 
 # ----------- CORE LIBS -----------
 import PyPDF2
@@ -12,16 +16,19 @@ from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import requests
 
-# ----------- OCR & IMAGE -----------
-from PIL import Image, ImageEnhance
-import pytesseract
-from pdf2image import convert_from_bytes
-import fitz  # PyMuPDF
-import imagehash
-
 # ----------- DOCUMENT PROCESSING -----------
-from docx import Document  # python-docx
-from pptx import Presentation  # python-pptx
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except:
+    DOCX_AVAILABLE = False
+
+try:
+    from pptx import Presentation
+    PPTX_AVAILABLE = True
+except:
+    PPTX_AVAILABLE = False
+
 import markdown
 from bs4 import BeautifulSoup
 
@@ -49,7 +56,6 @@ HEADERS = {
 def load_models():
     """Load embedding model, cross-encoder for reranking, and ChromaDB client"""
     embed = SentenceTransformer("all-MiniLM-L6-v2")
-    # Cross-encoder for reranking retrieved chunks
     reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     client = chromadb.Client(
         Settings(
@@ -62,19 +68,15 @@ def load_models():
 embedding_model, cross_encoder, chroma_client = load_models()
 
 # ================= CONSTANTS =================
-OCR_THRESHOLD = 50
-IMAGE_DIR = "data/images"
-os.makedirs(IMAGE_DIR, exist_ok=True)
-
 # Chunking parameters
-SEMANTIC_CHUNK_SIZE = 400  # Words per semantic chunk
-SLIDING_WINDOW_SIZE = 600  # Words for sliding window
-WINDOW_OVERLAP = 150  # Overlap between windows
+SEMANTIC_CHUNK_SIZE = 400
+SLIDING_WINDOW_SIZE = 600
+WINDOW_OVERLAP = 150
 
 # Retrieval parameters
-INITIAL_RETRIEVAL_K = 20  # Retrieve more initially
-RERANK_TOP_K = 10  # Keep top K after reranking
-FINAL_CONTEXT_K = 5  # Use top K for final answer
+INITIAL_RETRIEVAL_K = 20
+RERANK_TOP_K = 10
+FINAL_CONTEXT_K = 5
 
 HEADER_FOOTER_PATTERNS = [
     r'^\d+$',
@@ -85,7 +87,11 @@ HEADER_FOOTER_PATTERNS = [
     r'^\d+\s*/\s*\d+$',
 ]
 
-SUPPORTED_EXTENSIONS = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.md']
+SUPPORTED_EXTENSIONS = ['.pdf', '.txt', '.md']
+if DOCX_AVAILABLE:
+    SUPPORTED_EXTENSIONS.extend(['.docx', '.doc'])
+if PPTX_AVAILABLE:
+    SUPPORTED_EXTENSIONS.extend(['.pptx', '.ppt'])
 
 # ================= HEADER/FOOTER REMOVAL =================
 def is_header_footer(text: str) -> bool:
@@ -107,28 +113,21 @@ def clean_text(text: str) -> str:
 
 # ================= ZIP FILE HANDLING =================
 def extract_files_from_zip(zip_bytes: bytes) -> List[Dict]:
-    """
-    Extract all supported files from a ZIP archive.
-    Returns list of dicts with 'name' and 'bytes' keys.
-    """
+    """Extract all supported files from a ZIP archive."""
     extracted_files = []
     
     try:
         with zipfile.ZipFile(BytesIO(zip_bytes), 'r') as zip_ref:
             for file_info in zip_ref.filelist:
-                # Skip directories
                 if file_info.is_dir():
                     continue
                 
                 filename = file_info.filename
-                # Get file extension
                 ext = os.path.splitext(filename)[1].lower()
                 
-                # Check if supported
                 if ext in SUPPORTED_EXTENSIONS:
                     try:
                         file_bytes = zip_ref.read(file_info)
-                        # Use just the filename, not the full path
                         clean_name = os.path.basename(filename)
                         extracted_files.append({
                             'name': clean_name,
@@ -162,6 +161,9 @@ def extract_text_from_md(file_bytes: bytes) -> List[Dict]:
     return [{"page": 1, "text": text}] if text else []
 
 def extract_text_from_docx(file_bytes: bytes) -> List[Dict]:
+    if not DOCX_AVAILABLE:
+        st.error("DOCX support not available")
+        return []
     doc = Document(BytesIO(file_bytes))
     full_text = [para.text for para in doc.paragraphs if para.text.strip()]
     text = '\n'.join(full_text)
@@ -169,6 +171,9 @@ def extract_text_from_docx(file_bytes: bytes) -> List[Dict]:
     return [{"page": 1, "text": text}] if text else []
 
 def extract_text_from_pptx(file_bytes: bytes) -> List[Dict]:
+    if not PPTX_AVAILABLE:
+        st.error("PPTX support not available")
+        return []
     prs = Presentation(BytesIO(file_bytes))
     pages = []
     
@@ -181,27 +186,20 @@ def extract_text_from_pptx(file_bytes: bytes) -> List[Dict]:
     return pages
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> List[Dict]:
+    """Extract text from PDF using PyPDF2 (basic extraction, no OCR)"""
     reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
     pages = []
     
-    try:
-        images = convert_from_bytes(pdf_bytes, dpi=200)
-    except:
-        images = []
-    
     for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        text = text.strip()
-        
-        if len(text) < OCR_THRESHOLD and i < len(images):
-            img = images[i].convert("L")
-            ocr_text = pytesseract.image_to_string(img)
-            if len(ocr_text.strip()) > len(text):
-                text = ocr_text.strip()
-        
-        text = clean_text(text)
-        if text:
-            pages.append({"page": i + 1, "text": text})
+        try:
+            text = page.extract_text() or ""
+            text = text.strip()
+            text = clean_text(text)
+            
+            if text:
+                pages.append({"page": i + 1, "text": text})
+        except Exception as e:
+            st.warning(f"Could not extract page {i+1}: {str(e)}")
     
     return pages
 
@@ -211,11 +209,15 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> List[Dict]:
         '.pdf': extract_text_from_pdf,
         '.txt': extract_text_from_txt,
         '.md': extract_text_from_md,
-        '.docx': extract_text_from_docx,
-        '.doc': extract_text_from_docx,
-        '.pptx': extract_text_from_pptx,
-        '.ppt': extract_text_from_pptx,
     }
+    
+    if DOCX_AVAILABLE:
+        extractors['.docx'] = extract_text_from_docx
+        extractors['.doc'] = extract_text_from_docx
+    
+    if PPTX_AVAILABLE:
+        extractors['.pptx'] = extract_text_from_pptx
+        extractors['.ppt'] = extract_text_from_pptx
     
     extractor = extractors.get(ext)
     if extractor:
@@ -228,68 +230,9 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> List[Dict]:
         st.warning(f"Unsupported file type: {ext}")
         return []
 
-# ================= IMAGE UTILITIES =================
-def image_entropy(img: Image.Image) -> float:
-    hist = img.histogram()
-    total = sum(hist)
-    entropy = 0
-    for c in hist:
-        if c == 0:
-            continue
-        p = c / total
-        entropy -= p * math.log2(p)
-    return entropy
-
-def extract_images_from_pdf(pdf_bytes: bytes, doc_name: str) -> List[Dict]:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    seen_hashes = []
-    image_data = []
-    
-    for page_index in range(len(doc)):
-        page = doc[page_index]
-        images = page.get_images(full=True)
-        
-        for img in images:
-            base = doc.extract_image(img[0])
-            img_bytes = base["image"]
-            ext = base["ext"]
-            
-            pil = Image.open(BytesIO(img_bytes)).convert("RGB")
-            
-            if image_entropy(pil) < 4.0:
-                continue
-            
-            h = imagehash.phash(pil)
-            if any(abs(h - sh) <= 5 for sh in seen_hashes):
-                continue
-            
-            seen_hashes.append(h)
-            safe_name = re.sub(r'[^\w\-_.]', '_', doc_name)
-            path = os.path.join(IMAGE_DIR, f"{safe_name}_page{page_index+1}_{len(seen_hashes)}.{ext}")
-            
-            with open(path, "wb") as f:
-                f.write(img_bytes)
-            
-            image_data.append({"page": page_index + 1, "path": path, "doc": doc_name})
-    
-    doc.close()
-    return image_data
-
-def ocr_image_text(path: str) -> str:
-    try:
-        img = Image.open(path).convert("L")
-        img = ImageEnhance.Contrast(img).enhance(2.0)
-        text = pytesseract.image_to_string(img, config="--psm 6")
-        return re.sub(r"[^a-zA-Z0-9\s\.,:-]", "", text).strip()
-    except:
-        return ""
-
 # ================= ADVANCED CHUNKING =================
 def semantic_chunking(text: str, chunk_size: int = SEMANTIC_CHUNK_SIZE) -> List[str]:
-    """
-    Semantic chunking: splits text at sentence boundaries while respecting chunk size.
-    Preserves semantic coherence by not breaking mid-sentence.
-    """
+    """Semantic chunking: splits text at sentence boundaries."""
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
     current_chunk = []
@@ -314,10 +257,7 @@ def semantic_chunking(text: str, chunk_size: int = SEMANTIC_CHUNK_SIZE) -> List[
 
 def sliding_window_chunking(text: str, window_size: int = SLIDING_WINDOW_SIZE, 
                            overlap: int = WINDOW_OVERLAP) -> List[str]:
-    """
-    Sliding window chunking: creates overlapping chunks to maintain context.
-    Helps ensure important information isn't lost at chunk boundaries.
-    """
+    """Sliding window chunking: creates overlapping chunks."""
     words = text.split()
     chunks = []
     
@@ -332,9 +272,7 @@ def sliding_window_chunking(text: str, window_size: int = SLIDING_WINDOW_SIZE,
     return chunks
 
 def hybrid_chunking(pages: List[Dict]) -> List[Dict]:
-    """
-    Hybrid approach: combines semantic and sliding window chunking.
-    """
+    """Hybrid approach: combines semantic and sliding window chunking."""
     all_chunks = []
     chunk_id = 0
     
@@ -370,9 +308,7 @@ def hybrid_chunking(pages: List[Dict]) -> List[Dict]:
 
 # ================= MULTI-STAGE RETRIEVAL WITH RERANKING =================
 def retrieve_and_rerank(question: str, collection, top_k: int = FINAL_CONTEXT_K) -> List[Dict]:
-    """
-    Multi-stage retrieval with reranking and deduplication.
-    """
+    """Multi-stage retrieval with reranking and deduplication."""
     q_emb = embedding_model.encode([question]).tolist()
     res = collection.query(q_emb, n_results=INITIAL_RETRIEVAL_K)
     
@@ -527,11 +463,17 @@ if "chunk_stats" not in st.session_state:
     st.session_state.chunk_stats = {}
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
-if "query_mode" not in st.session_state:
-    st.session_state.query_mode = "chat"  # 'chat' or 'batch'
 
 # ================= UI =================
 st.header("📤 Upload Documents")
+
+# Display supported formats
+supported_str = "PDF, TXT, MD"
+if DOCX_AVAILABLE:
+    supported_str += ", DOCX"
+if PPTX_AVAILABLE:
+    supported_str += ", PPTX"
+st.caption(f"Supported formats: {supported_str}, ZIP")
 
 # Settings in sidebar
 with st.sidebar:
@@ -548,22 +490,26 @@ with st.sidebar:
     window_size = st.slider("Sliding Window Size (words)", 300, 1000, SLIDING_WINDOW_SIZE, 50)
     window_overlap = st.slider("Window Overlap (words)", 50, 300, WINDOW_OVERLAP, 25)
 
+file_types = ["pdf", "txt", "md", "zip"]
+if DOCX_AVAILABLE:
+    file_types.extend(["docx", "doc"])
+if PPTX_AVAILABLE:
+    file_types.extend(["pptx", "ppt"])
+
 uploaded_files = st.file_uploader(
     "Upload documents or ZIP files containing documents",
-    type=["pdf", "docx", "doc", "pptx", "ppt", "txt", "md", "zip"],
+    type=file_types,
     accept_multiple_files=True
 )
 
 if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunking"):
     with st.spinner("Processing documents with hybrid chunking strategy..."):
         all_pages = []
-        all_images = []
         files_to_process = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # First, handle ZIP files and collect all files to process
         status_text.info("📦 Extracting files from ZIP archives...")
         for uploaded in uploaded_files:
             if uploaded.name.lower().endswith('.zip'):
@@ -583,7 +529,6 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
         
         st.info(f"📄 Processing {len(files_to_process)} total files...")
         
-        # Process all files
         for idx, file_data in enumerate(files_to_process):
             status_text.info(f"📄 Processing: {file_data['name']}")
             
@@ -593,22 +538,7 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
                 p["doc"] = file_data['name']
             
             all_pages.extend(pages)
-            
-            if file_data['name'].lower().endswith('.pdf'):
-                images = extract_images_from_pdf(file_data['bytes'], file_data['name'])
-                all_images.extend(images)
-            
             progress_bar.progress((idx + 1) / len(files_to_process))
-        
-        status_text.info("🔍 Performing OCR on extracted images...")
-        for img in all_images:
-            text = ocr_image_text(img["path"])
-            if text:
-                all_pages.append({
-                    "page": img["page"],
-                    "text": f"[Image OCR] {text}",
-                    "doc": img["doc"]
-                })
         
         status_text.info("✂️ Applying hybrid chunking (semantic + sliding window)...")
         chunks = hybrid_chunking(all_pages)
@@ -649,7 +579,7 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
             }
             st.session_state.ready = True
             st.session_state.processed_files = [f['name'] for f in files_to_process]
-            st.session_state.chat_history = []  # Reset chat history
+            st.session_state.chat_history = []
             
             status_text.empty()
             progress_bar.empty()
@@ -677,7 +607,6 @@ if st.session_state.ready:
     st.divider()
     st.header("💬 Ask Questions")
     
-    # Show chunk statistics
     with st.expander("📊 Document Statistics", expanded=False):
         stats = st.session_state.chunk_stats
         col1, col2, col3 = st.columns(3)
@@ -693,21 +622,16 @@ if st.session_state.ready:
     # Display chat history
     for i, chat in enumerate(st.session_state.chat_history):
         with st.container():
-            # User message(s)
             if isinstance(chat['question'], list):
-                # Multiple questions (batch)
                 st.markdown("**👤 You asked:**")
                 for idx, q in enumerate(chat['question'], 1):
                     st.markdown(f"{idx}. {q}")
             else:
-                # Single question
                 st.markdown(f"**👤 You:** {chat['question']}")
             
-            st.markdown("")  # Spacing
+            st.markdown("")
             
-            # Assistant response(s)
             if isinstance(chat['answer'], dict):
-                # Multiple answers (batch)
                 for idx, (question, answer_data) in enumerate(chat['answer'].items(), 1):
                     st.markdown(f"**🤖 Assistant (Question {idx}):**")
                     st.markdown(f"""
@@ -717,7 +641,6 @@ if st.session_state.ready:
                     </div>
                     """, unsafe_allow_html=True)
                     
-                    # Sources for this specific question
                     with st.expander(f"📚 Sources for Question {idx}", expanded=False):
                         st.caption(f"**Chunks analyzed:** {answer_data.get('chunks_used', 0)}")
                         for j, source in enumerate(answer_data.get('sources', []), 1):
@@ -727,7 +650,6 @@ if st.session_state.ready:
                             <span style="color: {score_color}">Relevance Score: {source['score']:.3f}</span>
                             """, unsafe_allow_html=True)
             else:
-                # Single answer
                 st.markdown("**🤖 Assistant:**")
                 st.markdown(f"""
                 <div style="background-color: #000000; padding: 20px; border-radius: 10px; border-left: 5px solid #4CAF50; margin-bottom: 10px;">
@@ -735,7 +657,6 @@ if st.session_state.ready:
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # Sources
                 with st.expander(f"📚 Sources", expanded=False):
                     st.caption(f"**Chunks analyzed:** {chat.get('chunks_used', 0)}")
                     for j, source in enumerate(chat.get('sources', []), 1):
@@ -747,34 +668,28 @@ if st.session_state.ready:
             
             st.divider()
     
-    # Chat input at the bottom - handles both single and multiple questions
     user_input = st.chat_input("Ask one or multiple questions (separate with new lines)...")
     
     if user_input:
         col = chroma_client.get_collection("syllabus")
         
-        # Parse input to check for multiple questions
         questions = parse_multiple_questions(user_input)
         
         if len(questions) > 1:
-            # Batch processing - multiple questions
             with st.spinner(f"🔄 Processing {len(questions)} questions..."):
                 results = process_multiple_questions(questions, col)
                 
-                # Store in chat history as batch
                 chat_entry = {
-                    "question": questions,  # List of questions
-                    "answer": results,      # Dict of answers
+                    "question": questions,
+                    "answer": results,
                     "is_batch": True
                 }
                 st.session_state.chat_history.append(chat_entry)
         else:
-            # Single question processing
             with st.spinner("🔄 Retrieving and analyzing..."):
                 chunks = retrieve_and_rerank(questions[0], col, final_k)
                 answer = llm_query(questions[0], chunks)
                 
-                # Store in chat history as single
                 chat_entry = {
                     "question": questions[0],
                     "answer": answer,
@@ -790,7 +705,6 @@ if st.session_state.ready:
                 }
                 st.session_state.chat_history.append(chat_entry)
         
-        # Rerun to display the new message
         st.rerun()
 
 # ================= CONTROLS =================
@@ -803,8 +717,8 @@ with col1:
             chroma_client.delete_collection("syllabus")
         except:
             pass
-        shutil.rmtree(IMAGE_DIR, ignore_errors=True)
-        os.makedirs(IMAGE_DIR, exist_ok=True)
+        if os.path.exists("./chroma_db"):
+            shutil.rmtree("./chroma_db", ignore_errors=True)
         st.session_state.ready = False
         st.session_state.processed_files = []
         st.session_state.chunk_stats = {}
@@ -838,4 +752,5 @@ st.caption("""
 - 💬 Chat mode with single or batch question support
 - 📋 Intelligent parsing: automatically detects multiple questions
 - 📦 ZIP file support for bulk uploads
+- ⚡ Optimized for Streamlit Cloud deployment
 """)
