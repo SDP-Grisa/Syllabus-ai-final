@@ -3,6 +3,7 @@ import os, io, re, shutil, zipfile
 from io import BytesIO
 from typing import List, Dict
 import numpy as np
+import fitz
 
 # # Fix for ChromaDB on Streamlit Cloud
 # import sys
@@ -227,7 +228,60 @@ def extract_text_from_image(file_bytes: bytes) -> List[Dict]:
         return []
     
 def extract_text_from_pdf(pdf_bytes: bytes) -> List[Dict]:
-    """Extract text from PDF using PyPDF2 (basic extraction, no OCR)"""
+    """Extract text from PDF using PyMuPDF with OCR fallback for scanned pages"""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pages = []
+        ocr_count = 0
+        
+        for i in range(len(doc)):
+            page = doc[i]
+            
+            # Try regular text extraction first
+            text = page.get_text().strip()
+            text = clean_text(text)
+            
+            # If no meaningful text found, use OCR
+            if not text or len(text.split()) < 10:
+                try:
+                    # Get EasyOCR reader if available
+                    if IMAGE_AVAILABLE:
+                        # Render page as image (higher DPI for better OCR)
+                        mat = fitz.Matrix(2, 2)  # 2x zoom = ~144 DPI
+                        pix = page.get_pixmap(matrix=mat)
+                        
+                        # Convert to PIL Image
+                        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                        
+                        # Convert to numpy array for EasyOCR
+                        img_array = np.array(img)
+                        
+                        # Perform OCR
+                        reader = get_ocr_reader()
+                        results = reader.readtext(img_array)
+                        text = ' '.join([result[1] for result in results])
+                        text = clean_text(text)
+                        ocr_count += 1
+                except Exception as e:
+                    st.warning(f"⚠️ OCR failed for page {i+1}: {str(e)}")
+            
+            if text:
+                pages.append({"page": i + 1, "text": text})
+        
+        doc.close()
+        
+        if ocr_count > 0:
+            st.success(f"✅ Performed OCR on {ocr_count} page(s) with non-selectable text")
+        
+        return pages
+        
+    except Exception as e:
+        st.error(f"❌ Error processing PDF: {str(e)}")
+        # Fallback to PyPDF2 if PyMuPDF fails
+        return extract_text_from_pdf_fallback(pdf_bytes)
+
+def extract_text_from_pdf_fallback(pdf_bytes: bytes) -> List[Dict]:
+    """Fallback PDF extraction using PyPDF2 (original method)"""
     reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
     pages = []
     for i, page in enumerate(reader.pages):
