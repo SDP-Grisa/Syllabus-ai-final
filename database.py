@@ -4,7 +4,7 @@ from io import BytesIO
 from typing import List, Dict
 import numpy as np
 
-# Fix for ChromaDB on Streamlit Cloud
+# # Fix for ChromaDB on Streamlit Cloud
 # import sys
 # __import__('pysqlite3')
 # sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
@@ -29,6 +29,14 @@ try:
 except:
     PPTX_AVAILABLE = False
 
+# ----------- IMAGE PROCESSING -----------
+try:
+    from PIL import Image
+    import pytesseract
+    IMAGE_AVAILABLE = True
+except:
+    IMAGE_AVAILABLE = False
+
 import markdown
 from bs4 import BeautifulSoup
 
@@ -46,6 +54,7 @@ st.caption("Multi-stage retrieval with semantic chunking and cross-encoder reran
 HF_TOKEN = st.secrets["HF_TOKEN"]
 HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
 MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct:fastest"
+
 HEADERS = {
     "Authorization": f"Bearer {HF_TOKEN}",
     "Content-Type": "application/json"
@@ -92,13 +101,14 @@ if DOCX_AVAILABLE:
     SUPPORTED_EXTENSIONS.extend(['.docx', '.doc'])
 if PPTX_AVAILABLE:
     SUPPORTED_EXTENSIONS.extend(['.pptx', '.ppt'])
+if IMAGE_AVAILABLE:
+    SUPPORTED_EXTENSIONS.extend(['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'])
 
 # ================= HEADER/FOOTER REMOVAL =================
 def is_header_footer(text: str) -> bool:
     text = text.strip()
     if len(text) < 3 or len(text) > 100:
         return len(text) < 3
-    
     for pattern in HEADER_FOOTER_PATTERNS:
         if re.match(pattern, text, re.IGNORECASE):
             return True
@@ -115,16 +125,13 @@ def clean_text(text: str) -> str:
 def extract_files_from_zip(zip_bytes: bytes) -> List[Dict]:
     """Extract all supported files from a ZIP archive."""
     extracted_files = []
-    
     try:
         with zipfile.ZipFile(BytesIO(zip_bytes), 'r') as zip_ref:
             for file_info in zip_ref.filelist:
                 if file_info.is_dir():
                     continue
-                
                 filename = file_info.filename
                 ext = os.path.splitext(filename)[1].lower()
-                
                 if ext in SUPPORTED_EXTENSIONS:
                     try:
                         file_bytes = zip_ref.read(file_info)
@@ -137,7 +144,6 @@ def extract_files_from_zip(zip_bytes: bytes) -> List[Dict]:
                         st.warning(f"⚠️ Could not extract {filename}: {str(e)}")
     except Exception as e:
         st.error(f"❌ Error reading ZIP file: {str(e)}")
-    
     return extracted_files
 
 # ================= TEXT EXTRACTION BY FILE TYPE =================
@@ -176,7 +182,6 @@ def extract_text_from_pptx(file_bytes: bytes) -> List[Dict]:
         return []
     prs = Presentation(BytesIO(file_bytes))
     pages = []
-    
     for i, slide in enumerate(prs.slides):
         text_parts = [shape.text for shape in slide.shapes if hasattr(shape, "text") and shape.text]
         text = '\n'.join(text_parts)
@@ -185,26 +190,50 @@ def extract_text_from_pptx(file_bytes: bytes) -> List[Dict]:
             pages.append({"page": i + 1, "text": text})
     return pages
 
+def extract_text_from_image(file_bytes: bytes) -> List[Dict]:
+    """Extract text from images using OCR (Tesseract)"""
+    if not IMAGE_AVAILABLE:
+        st.error("Image processing not available. Install PIL and pytesseract.")
+        return []
+    
+    try:
+        image = Image.open(BytesIO(file_bytes))
+        
+        # Convert to RGB if necessary
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Perform OCR
+        text = pytesseract.image_to_string(image)
+        text = clean_text(text)
+        
+        if text:
+            return [{"page": 1, "text": text}]
+        else:
+            st.warning("⚠️ No text found in image")
+            return []
+    except Exception as e:
+        st.error(f"❌ Error processing image: {str(e)}")
+        return []
+
 def extract_text_from_pdf(pdf_bytes: bytes) -> List[Dict]:
     """Extract text from PDF using PyPDF2 (basic extraction, no OCR)"""
     reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
     pages = []
-    
     for i, page in enumerate(reader.pages):
         try:
             text = page.extract_text() or ""
             text = text.strip()
             text = clean_text(text)
-            
             if text:
                 pages.append({"page": i + 1, "text": text})
         except Exception as e:
             st.warning(f"Could not extract page {i+1}: {str(e)}")
-    
     return pages
 
 def extract_text_from_file(file_bytes: bytes, filename: str) -> List[Dict]:
     ext = os.path.splitext(filename)[1].lower()
+    
     extractors = {
         '.pdf': extract_text_from_pdf,
         '.txt': extract_text_from_txt,
@@ -218,6 +247,14 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> List[Dict]:
     if PPTX_AVAILABLE:
         extractors['.pptx'] = extract_text_from_pptx
         extractors['.ppt'] = extract_text_from_pptx
+    
+    if IMAGE_AVAILABLE:
+        extractors['.png'] = extract_text_from_image
+        extractors['.jpg'] = extract_text_from_image
+        extractors['.jpeg'] = extract_text_from_image
+        extractors['.bmp'] = extract_text_from_image
+        extractors['.tiff'] = extract_text_from_image
+        extractors['.tif'] = extract_text_from_image
     
     extractor = extractors.get(ext)
     if extractor:
@@ -255,8 +292,7 @@ def semantic_chunking(text: str, chunk_size: int = SEMANTIC_CHUNK_SIZE) -> List[
     
     return chunks
 
-def sliding_window_chunking(text: str, window_size: int = SLIDING_WINDOW_SIZE, 
-                           overlap: int = WINDOW_OVERLAP) -> List[str]:
+def sliding_window_chunking(text: str, window_size: int = SLIDING_WINDOW_SIZE, overlap: int = WINDOW_OVERLAP) -> List[str]:
     """Sliding window chunking: creates overlapping chunks."""
     words = text.split()
     chunks = []
@@ -265,7 +301,6 @@ def sliding_window_chunking(text: str, window_size: int = SLIDING_WINDOW_SIZE,
         chunk = ' '.join(words[i:i + window_size])
         if chunk.strip():
             chunks.append(chunk)
-        
         if i + window_size >= len(words):
             break
     
@@ -280,7 +315,6 @@ def hybrid_chunking(pages: List[Dict]) -> List[Dict]:
         text = p["text"]
         
         semantic_chunks = semantic_chunking(text, SEMANTIC_CHUNK_SIZE)
-        
         for sem_chunk in semantic_chunks:
             all_chunks.append({
                 "page": p["page"],
@@ -293,7 +327,6 @@ def hybrid_chunking(pages: List[Dict]) -> List[Dict]:
         
         if len(text.split()) > SLIDING_WINDOW_SIZE:
             window_chunks = sliding_window_chunking(text, SLIDING_WINDOW_SIZE, WINDOW_OVERLAP)
-            
             for win_chunk in window_chunks:
                 all_chunks.append({
                     "page": p["page"],
@@ -335,7 +368,6 @@ def retrieve_and_rerank(question: str, collection, top_k: int = FINAL_CONTEXT_K)
     
     final_chunks = []
     seen_texts = []
-    
     for candidate in candidates[:RERANK_TOP_K]:
         is_duplicate = False
         for seen in seen_texts:
@@ -348,9 +380,9 @@ def retrieve_and_rerank(question: str, collection, top_k: int = FINAL_CONTEXT_K)
         if not is_duplicate:
             final_chunks.append(candidate)
             seen_texts.append(candidate["text"])
-            
-            if len(final_chunks) >= top_k:
-                break
+        
+        if len(final_chunks) >= top_k:
+            break
     
     return final_chunks
 
@@ -401,7 +433,8 @@ def llm_query(question: str, chunks: List[Dict]) -> str:
 **DOCUMENT CONTENT:**
 {context}
 
-**QUESTION:** {question}
+**QUESTION:**
+{question}
 
 **ANSWER:**"""
     
@@ -409,7 +442,7 @@ def llm_query(question: str, chunks: List[Dict]) -> str:
         "model": MODEL_NAME,
         "messages": [
             {
-                "role": "system", 
+                "role": "system",
                 "content": "You are an expert teaching assistant who provides clear, well-structured, and comprehensive answers based on document content. You format answers with appropriate structure including bullet points, paragraphs, and explanations for easy understanding."
             },
             {"role": "user", "content": prompt}
@@ -421,13 +454,10 @@ def llm_query(question: str, chunks: List[Dict]) -> str:
     
     try:
         r = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=30)
-        
         if r.status_code != 200:
             return f"⚠️ API Error: {r.status_code}"
-        
         result = r.json()
         answer = result["choices"][0]["message"]["content"].strip()
-        
         return answer
     except Exception as e:
         return f"⚠️ Error querying LLM: {str(e)}"
@@ -439,16 +469,16 @@ def process_multiple_questions(questions: List[str], collection) -> Dict[str, Di
     for q in questions:
         chunks = retrieve_and_rerank(q, collection, FINAL_CONTEXT_K)
         answer = llm_query(q, chunks)
-        
         results[q] = {
             "answer": answer,
             "chunks_used": len(chunks),
             "sources": [
                 {
-                    "doc": c.get("doc"), 
-                    "page": c.get("page"), 
+                    "doc": c.get("doc"),
+                    "page": c.get("page"),
                     "score": c.get("rerank_score", 0)
-                } for c in chunks
+                }
+                for c in chunks
             ]
         }
     
@@ -473,7 +503,13 @@ if DOCX_AVAILABLE:
     supported_str += ", DOCX"
 if PPTX_AVAILABLE:
     supported_str += ", PPTX"
+if IMAGE_AVAILABLE:
+    supported_str += ", PNG, JPG, JPEG, BMP, TIFF"
 st.caption(f"Supported formats: {supported_str}, ZIP")
+
+# Show warning if image support is not available
+if not IMAGE_AVAILABLE:
+    st.warning("⚠️ Image processing not available. Install `Pillow` and `pytesseract` to enable image support.")
 
 # Settings in sidebar
 with st.sidebar:
@@ -495,6 +531,8 @@ if DOCX_AVAILABLE:
     file_types.extend(["docx", "doc"])
 if PPTX_AVAILABLE:
     file_types.extend(["pptx", "ppt"])
+if IMAGE_AVAILABLE:
+    file_types.extend(["png", "jpg", "jpeg", "bmp", "tiff", "tif"])
 
 uploaded_files = st.file_uploader(
     "Upload documents or ZIP files containing documents",
@@ -531,7 +569,6 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
         
         for idx, file_data in enumerate(files_to_process):
             status_text.info(f"📄 Processing: {file_data['name']}")
-            
             pages = extract_text_from_file(file_data['bytes'], file_data['name'])
             
             for p in pages:
@@ -561,10 +598,11 @@ if uploaded_files and st.button("🚀 Process All Documents with Advanced Chunki
                 embeddings=embeddings,
                 metadatas=[
                     {
-                        "page": c["page"], 
+                        "page": c["page"],
                         "doc": c.get("doc", "unknown"),
                         "chunk_type": c.get("chunk_type", "unknown")
-                    } for c in chunks
+                    }
+                    for c in chunks
                 ],
                 ids=[f"c{i}" for i in range(len(texts))]
             )
@@ -634,12 +672,10 @@ if st.session_state.ready:
             if isinstance(chat['answer'], dict):
                 for idx, (question, answer_data) in enumerate(chat['answer'].items(), 1):
                     st.markdown(f"**🤖 Assistant (Question {idx}):**")
-                    st.markdown(f"""
-                    <div style="background-color: #000000; padding: 20px; border-radius: 10px; border-left: 5px solid #4CAF50; margin-bottom: 15px;">
-                    <strong style="color: #1f77b4;">Q{idx}: {question}</strong><br><br>
-                    {answer_data['answer']}
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.markdown(f"""<div style='background-color: #000000; padding: 15px; border-radius: 10px; margin: 10px 0;'>
+                        <strong>Q{idx}: {question}</strong><br><br>
+                        {answer_data['answer']}
+                    </div>""", unsafe_allow_html=True)
                     
                     with st.expander(f"📚 Sources for Question {idx}", expanded=False):
                         st.caption(f"**Chunks analyzed:** {answer_data.get('chunks_used', 0)}")
@@ -647,15 +683,13 @@ if st.session_state.ready:
                             score_color = "#4CAF50" if source['score'] > 0.5 else "#FF9800"
                             st.markdown(f"""
                             **Source {j}:** {source['doc']} (Page {source['page']})  
-                            <span style="color: {score_color}">Relevance Score: {source['score']:.3f}</span>
+                            <span style='color: {score_color};'>Relevance Score: {source['score']:.3f}</span>
                             """, unsafe_allow_html=True)
             else:
                 st.markdown("**🤖 Assistant:**")
-                st.markdown(f"""
-                <div style="background-color: #000000; padding: 20px; border-radius: 10px; border-left: 5px solid #4CAF50; margin-bottom: 10px;">
-                {chat['answer']}
-                </div>
-                """, unsafe_allow_html=True)
+                st.markdown(f"""<div style='background-color: #000000; padding: 15px; border-radius: 10px; margin: 10px 0;'>
+                    {chat['answer']}
+                </div>""", unsafe_allow_html=True)
                 
                 with st.expander(f"📚 Sources", expanded=False):
                     st.caption(f"**Chunks analyzed:** {chat.get('chunks_used', 0)}")
@@ -663,7 +697,7 @@ if st.session_state.ready:
                         score_color = "#4CAF50" if source['score'] > 0.5 else "#FF9800"
                         st.markdown(f"""
                         **Source {j}:** {source['doc']} (Page {source['page']})  
-                        <span style="color: {score_color}">Relevance Score: {source['score']:.3f}</span>
+                        <span style='color: {score_color};'>Relevance Score: {source['score']:.3f}</span>
                         """, unsafe_allow_html=True)
             
             st.divider()
@@ -672,13 +706,11 @@ if st.session_state.ready:
     
     if user_input:
         col = chroma_client.get_collection("syllabus")
-        
         questions = parse_multiple_questions(user_input)
         
         if len(questions) > 1:
             with st.spinner(f"🔄 Processing {len(questions)} questions..."):
                 results = process_multiple_questions(questions, col)
-                
                 chat_entry = {
                     "question": questions,
                     "answer": results,
@@ -696,10 +728,11 @@ if st.session_state.ready:
                     "chunks_used": len(chunks),
                     "sources": [
                         {
-                            "doc": c.get("doc"), 
-                            "page": c.get("page"), 
+                            "doc": c.get("doc"),
+                            "page": c.get("page"),
                             "score": c.get("rerank_score", 0)
-                        } for c in chunks
+                        }
+                        for c in chunks
                     ],
                     "is_batch": False
                 }
