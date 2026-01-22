@@ -32,8 +32,12 @@ except:
 # ----------- IMAGE PROCESSING -----------
 try:
     from PIL import Image
-    import pytesseract
+    import easyocr
     IMAGE_AVAILABLE = True
+    # Initialize reader once
+    @st.cache_resource
+    def get_ocr_reader():
+        return easyocr.Reader(['en'], gpu=False)
 except:
     IMAGE_AVAILABLE = False
 
@@ -191,20 +195,26 @@ def extract_text_from_pptx(file_bytes: bytes) -> List[Dict]:
     return pages
 
 def extract_text_from_image(file_bytes: bytes) -> List[Dict]:
-    """Extract text from images using OCR (Tesseract)"""
+    """Extract text from images using EasyOCR"""
     if not IMAGE_AVAILABLE:
-        st.error("Image processing not available. Install PIL and pytesseract.")
+        st.error("Image processing not available. Install PIL and easyocr.")
         return []
     
     try:
         image = Image.open(BytesIO(file_bytes))
         
-        # Convert to RGB if necessary
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
+        # Convert PIL image to numpy array for EasyOCR
+        import numpy as np
+        img_array = np.array(image)
+        
+        # Get OCR reader
+        reader = get_ocr_reader()
         
         # Perform OCR
-        text = pytesseract.image_to_string(image)
+        results = reader.readtext(img_array)
+        
+        # Extract text from results
+        text = ' '.join([result[1] for result in results])
         text = clean_text(text)
         
         if text:
@@ -215,7 +225,7 @@ def extract_text_from_image(file_bytes: bytes) -> List[Dict]:
     except Exception as e:
         st.error(f"❌ Error processing image: {str(e)}")
         return []
-
+    
 def extract_text_from_pdf(pdf_bytes: bytes) -> List[Dict]:
     """Extract text from PDF using PyPDF2 (basic extraction, no OCR)"""
     reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
